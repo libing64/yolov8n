@@ -218,6 +218,8 @@ class TaskAlignedAssigner(nn.Module):
         target_labels = gt_labels.long().flatten()[target_gt_idx_flat] # (b, anchors)
         target_bboxes = gt_bboxes.view(-1, 4)[target_gt_idx_flat] # (b, anchors, 4)
         
+        target_labels.clamp_(0)
+        
         # target scores
         target_scores = torch.zeros((self.bs, pd_scores.shape[1], self.num_classes), 
                                     dtype=torch.float32, 
@@ -309,6 +311,11 @@ class v8DetectionLoss(nn.Module):
         gt_labels = batch['cls'] # (B, max_boxes, 1)
         gt_bboxes = batch['bboxes'] # (B, max_boxes, 4)
         
+        # Check if targets are empty or only padding
+        if gt_labels.shape[1] == 0 or (gt_labels > -1).sum() == 0:
+             # Return zero loss
+             return loss.sum() * batch['img'].shape[0], torch.cat((loss[0].unsqueeze(0), loss[1].unsqueeze(0), loss[2].unsqueeze(0))).detach()
+
         # mask_gt: Valid boxes. My dataset pads with -1 for cls, or we can check bboxes sum > 0
         mask_gt = (gt_labels > -1) & (gt_bboxes.sum(-1, keepdim=True) > 0)
         
