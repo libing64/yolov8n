@@ -9,7 +9,7 @@ class BboxLoss(nn.Module):
         self.reg_max = reg_max
         self.use_dfl = use_dfl
 
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
+    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, stride_tensor):
         # IoU loss
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
@@ -17,8 +17,31 @@ class BboxLoss(nn.Module):
 
         # DFL loss
         if self.use_dfl:
-            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.reg_max)
-            loss_dfl = self._df_loss(pred_dist[fg_mask].view(-1, self.reg_max + 1), target_ltrb[fg_mask]) * weight
+            # target_bboxes is (B, A, 4) absolute coords
+            # anchor_points is (A, 2) grid coords
+            # stride_tensor is (A, 1)
+            # fg_mask is (B, A) bool
+            
+            # Get foreground predictions and targets
+            pred_dist_fg = pred_dist[fg_mask] # (N_fg, 4*reg_max)
+            target_bboxes_fg = target_bboxes[fg_mask] # (N_fg, 4)
+            
+            # Get strides for foreground anchors
+            # stride_tensor: (A, 1) -> (1, A, 1) -> expand to (B, A, 1) -> select fg -> (N_fg, 1)
+            stride_fg = stride_tensor.unsqueeze(0).expand(fg_mask.shape[0], -1, -1)[fg_mask] # (N_fg, 1)
+            
+            # Get anchor points for foreground anchors
+            # anchor_points: (A, 2) -> (1, A, 2) -> expand to (B, A, 2) -> select fg -> (N_fg, 2)
+            anchor_points_fg = anchor_points.unsqueeze(0).expand(fg_mask.shape[0], -1, -1)[fg_mask] # (N_fg, 2)
+            
+            # Convert target bboxes to grid coordinates
+            target_bboxes_grid = target_bboxes_fg / stride_fg # (N_fg, 4)
+            
+            # Calculate target ltrb distances in grid coordinates
+            target_ltrb = bbox2dist(anchor_points_fg, target_bboxes_grid, self.reg_max) # (N_fg, 4)
+            
+            # Calculate DFL loss
+            loss_dfl = self._df_loss(pred_dist_fg.view(-1, self.reg_max + 1), target_ltrb) * weight
             loss_dfl = loss_dfl.sum() / target_scores_sum
         else:
             loss_dfl = torch.tensor(0.0).to(pred_dist.device)
@@ -53,18 +76,9 @@ class TaskAlignedAssigner(nn.Module):
 
     @torch.no_grad()
     def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
-        """
-        Args:
-            pd_scores (Tensor): (b, num_anchors, num_classes)
-            pd_bboxes (Tensor): (b, num_anchors, 4)
-            anc_points (Tensor): (num_anchors, 2)
-            gt_labels (Tensor): (b, n_max_boxes, 1)
-            gt_bboxes (Tensor): (b, n_max_boxes, 4)
-            mask_gt (Tensor): (b, n_max_boxes, 1) - mask for valid boxes
-        """
         self.bs = pd_scores.size(0)
         self.n_max_boxes = gt_bboxes.size(1)
-
+        
         if self.n_max_boxes == 0:
             return torch.full_like(pd_scores[..., 0], self.bg_idx).to(torch.long), \
                    torch.zeros_like(pd_bboxes), \
@@ -77,11 +91,35 @@ class TaskAlignedAssigner(nn.Module):
 
         target_gt_idx, fg_mask, mask_pos = self.select_topk_candidates(
             mask_pos, align_metric, overlaps)
-
-        target_labels, target_bboxes, target_scores = self.get_targets(
-            gt_labels, gt_bboxes, target_gt_idx, fg_mask)
-
-        return target_labels, target_bboxes, target_scores, fg_mask.bool(), target_gt_idx
+        
+        # target_gt_idx: (b, anchors) - index of best gt for each anchor
+        # fg_mask: (b, anchors) - whether anchor is foreground (1) or background (0)
+        
+        # Get targets
+        batch_ind = torch.arange(end=self.bs, dtype=torch.int64, device=gt_labels.device)[..., None]
+        target_gt_idx_flat = target_gt_idx + batch_ind * self.n_max_boxes
+        
+        target_labels = gt_labels.long().flatten()[target_gt_idx_flat] # (b, anchors)
+        target_bboxes = gt_bboxes.view(-1, 4)[target_gt_idx_flat] # (b, anchors, 4)
+        
+        target_labels.clamp_(0)
+        
+        # target scores
+        target_scores = torch.zeros((self.bs, pd_scores.shape[1], self.num_classes), 
+                                    dtype=torch.float32, 
+                                    device=gt_labels.device)
+        
+        # Get alignment metrics for selected pairs
+        # align_metric is (b, n_boxes, anchors)
+        # mask_pos is (b, n_boxes, anchors)
+        
+        align_metric = align_metric * mask_pos
+        pos_align_metrics = align_metric.amax(axis=1) # (b, anchors)
+        pos_overlaps = (overlaps * mask_pos).amax(axis=1) # (b, anchors)
+        
+        target_scores.scatter_(2, target_labels.unsqueeze(-1), pos_align_metrics.unsqueeze(-1))
+        
+        return target_bboxes, target_scores, fg_mask.bool()
 
     def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt):
         # pd_scores: (b, anchors, classes)
@@ -156,87 +194,6 @@ class TaskAlignedAssigner(nn.Module):
         target_gt_idx = mask_pos.argmax(-2) # (b, anchors)
         
         return target_gt_idx, fg_mask, mask_pos
-
-    def get_targets(self, gt_labels, gt_bboxes, target_gt_idx, fg_mask):
-        # gt_labels: (b, n_boxes, 1)
-        # gt_bboxes: (b, n_boxes, 4)
-        # target_gt_idx: (b, anchors)
-        # fg_mask: (b, anchors)
-        
-        batch_ind = torch.arange(end=self.bs, dtype=torch.int64, device=gt_labels.device)[..., None]
-        target_gt_idx = target_gt_idx + batch_ind * self.n_max_boxes  # flatten index
-        
-        target_labels = gt_labels.long().flatten()[target_gt_idx] # (b, anchors)
-        target_bboxes = gt_bboxes.view(-1, 4)[target_gt_idx] # (b, anchors, 4)
-        
-        target_labels.clamp_(0)
-        
-        # target scores
-        # we need alignment metric again? No, we need one-hot of label * alignment metric (soft label)
-        # but here we return just labels and bboxes, scores are computed in loss loop or return here?
-        # Usually we return soft labels.
-        
-        # Wait, the official implementation returns `target_scores` which is (b, anchors, classes)
-        # Populated with alignment_metric for the target class.
-        
-        target_scores = torch.zeros((self.bs, fg_mask.shape[1], self.num_classes), 
-                                    dtype=torch.float32, 
-                                    device=gt_labels.device) # (b, anchors, classes)
-        
-        # We need the alignment metric values for the selected pairs
-        # But I didn't return them from select_topk_candidates...
-        # Let's assume we recompute or change flow.
-        # Actually simplest is to compute it in forward
-        
-        return target_labels, target_bboxes, target_scores # partial return, fixing in forward
-
-    # Redefining forward to include metric collection because splitting was messy
-    def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
-        self.bs = pd_scores.size(0)
-        self.n_max_boxes = gt_bboxes.size(1)
-        
-        if self.n_max_boxes == 0:
-            return torch.full_like(pd_scores[..., 0], self.bg_idx).to(torch.long), \
-                   torch.zeros_like(pd_bboxes), \
-                   torch.zeros_like(pd_scores), \
-                   torch.zeros_like(pd_scores[..., 0]), \
-                   torch.zeros_like(pd_scores[..., 0])
-
-        mask_pos, align_metric, overlaps = self.get_pos_mask(
-            pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt)
-
-        target_gt_idx, fg_mask, mask_pos = self.select_topk_candidates(
-            mask_pos, align_metric, overlaps)
-        
-        # target_gt_idx: (b, anchors) - index of best gt for each anchor
-        # fg_mask: (b, anchors) - whether anchor is foreground (1) or background (0)
-        
-        # Get targets
-        batch_ind = torch.arange(end=self.bs, dtype=torch.int64, device=gt_labels.device)[..., None]
-        target_gt_idx_flat = target_gt_idx + batch_ind * self.n_max_boxes
-        
-        target_labels = gt_labels.long().flatten()[target_gt_idx_flat] # (b, anchors)
-        target_bboxes = gt_bboxes.view(-1, 4)[target_gt_idx_flat] # (b, anchors, 4)
-        
-        target_labels.clamp_(0)
-        
-        # target scores
-        target_scores = torch.zeros((self.bs, pd_scores.shape[1], self.num_classes), 
-                                    dtype=torch.float32, 
-                                    device=gt_labels.device)
-        
-        # Get alignment metrics for selected pairs
-        # align_metric is (b, n_boxes, anchors)
-        # mask_pos is (b, n_boxes, anchors)
-        
-        align_metric = align_metric * mask_pos
-        pos_align_metrics = align_metric.amax(axis=1) # (b, anchors)
-        pos_overlaps = (overlaps * mask_pos).amax(axis=1) # (b, anchors)
-        
-        target_scores.scatter_(2, target_labels.unsqueeze(-1), pos_align_metrics.unsqueeze(-1))
-        
-        return target_bboxes, target_scores, fg_mask.bool()
-
 
 class v8DetectionLoss(nn.Module):
     def __init__(self, model, device=None):
@@ -336,24 +293,49 @@ class v8DetectionLoss(nn.Module):
         target_bboxes, target_scores, fg_mask = self.assigner(
             pred_scores.detach().sigmoid(),
             pred_bboxes.detach(),
-            anchor_points,
+            anchor_points * stride_tensor, # FIX: Scale anchors to absolute coords
             gt_labels,
             gt_bboxes,
             mask_gt
         )
         
+        # Debug output
+        if not hasattr(self, '_debug_printed'):
+            print(f"\nLoss Debug:")
+            print(f"  anchor_points range: {anchor_points.min():.2f} - {anchor_points.max():.2f}")
+            print(f"  stride_tensor range: {stride_tensor.min():.2f} - {stride_tensor.max():.2f}")
+            print(f"  anchor_points * stride: {(anchor_points * stride_tensor).min():.2f} - {(anchor_points * stride_tensor).max():.2f}")
+            print(f"  gt_bboxes range: {gt_bboxes.min():.2f} - {gt_bboxes.max():.2f}")
+            print(f"  pred_bboxes range: {pred_bboxes.min():.2f} - {pred_bboxes.max():.2f}")
+            print(f"  fg_mask sum: {fg_mask.sum().item()}")
+            print(f"  target_scores sum: {target_scores.sum().item()}")
+            self._debug_printed = True
+        
         target_scores_sum = max(target_scores.sum(), 1)
         
         # Cls loss
-        loss[1] = self.bce(pred_scores, target_scores.to(pred_scores.dtype)).sum() / target_scores_sum # BCE
+        # Use mean reduction over all spatial locations, then scale by batch size
+        # This gives stable gradients
+        loss[1] = self.bce(pred_scores, target_scores.to(pred_scores.dtype)).mean() * pred_scores.shape[0] # BCE
         
         # Bbox loss
         if fg_mask.sum():
-            loss[0], loss[2] = self.bbox_loss(pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask)
+            loss[0], loss[2] = self.bbox_loss(pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, stride_tensor)
+        
+        # Debug loss values before scaling
+        if not hasattr(self, '_loss_debug'):
+            print(f"  Raw losses - box: {loss[0].item():.4f}, cls: {loss[1].item():.4f}, dfl: {loss[2].item():.4f}")
+            self._loss_debug = True
             
         loss[0] *= self.hyp['box']
         loss[1] *= self.hyp['cls']
         loss[2] *= self.hyp['dfl']
         
-        return loss.sum() * batch['img'].shape[0], torch.cat((loss[0].unsqueeze(0), loss[1].unsqueeze(0), loss[2].unsqueeze(0))).detach()
-
+        # Debug loss values after scaling
+        if not hasattr(self, '_loss_debug2'):
+            print(f"  Scaled losses - box: {loss[0].item():.4f}, cls: {loss[1].item():.4f}, dfl: {loss[2].item():.4f}")
+            print(f"  Total loss: {loss.sum().item():.4f}")
+            self._loss_debug2 = True
+        
+        # Return total loss (don't multiply by batch_size - that's wrong!)
+        return loss.sum(), torch.cat((loss[0].unsqueeze(0), loss[1].unsqueeze(0), loss[2].unsqueeze(0))).detach()

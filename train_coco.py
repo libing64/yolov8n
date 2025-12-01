@@ -43,11 +43,23 @@ def train(args):
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
         total_loss = 0
+        debug_printed = False
         
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             imgs = batch['img'].to(device)
             batch['cls'] = batch['cls'].to(device)
             batch['bboxes'] = batch['bboxes'].to(device)
+            
+            # Debug first batch
+            if not debug_printed:
+                print(f"\nDebug info:")
+                print(f"  Image shape: {imgs.shape}")
+                print(f"  Labels shape: {batch['cls'].shape}")
+                print(f"  Bboxes shape: {batch['bboxes'].shape}")
+                print(f"  Valid boxes: {(batch['cls'] > -1).sum().item()}")
+                print(f"  Sample labels: {batch['cls'][0, :5].flatten()}")
+                print(f"  Sample bboxes: {batch['bboxes'][0, :3]}")
+                debug_printed = True
             
             # Forward
             preds = model(imgs)
@@ -55,12 +67,22 @@ def train(args):
             # Loss
             loss, loss_items = compute_loss(preds, batch)
             
+            # Check for NaN
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"WARNING: Loss is NaN or Inf at batch {batch_idx}")
+                continue
+            
             # Backward
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             
             total_loss += loss.item()
+            
+            # Print actual loss values occasionally
+            if batch_idx < 5 or batch_idx % 1000 == 0:
+                print(f"\nBatch {batch_idx}: loss={loss.item():.4f}, box={loss_items[0].item():.4f}, cls={loss_items[1].item():.4f}, dfl={loss_items[2].item():.4f}")
+            
             pbar.set_postfix({'loss': f"{loss.item():.4f}", 'box': f"{loss_items[0].item():.4f}", 'cls': f"{loss_items[1].item():.4f}"})
             
         scheduler.step()
@@ -85,4 +107,3 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     train(args)
-
