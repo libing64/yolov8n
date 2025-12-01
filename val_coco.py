@@ -58,6 +58,8 @@ def validate(args):
     pbar = tqdm(val_loader, desc="Validating")
     for batch in pbar:
         imgs = batch['img'].to(device)
+        batch['cls'] = batch['cls'].to(device)
+        batch['bboxes'] = batch['bboxes'].to(device)
         
         # Reconstruct targets
         targets = []
@@ -72,7 +74,7 @@ def validate(args):
                 t_cls = t_cls[valid]
                 t_bbox = t_bbox[valid]
                 
-                t_bbox = t_bbox * torch.tensor([w, h, w, h], device=device)
+                t_bbox = t_bbox * torch.tensor([w, h, w, h], device=t_bbox.device)
                 t_bbox = xywh2xyxy(t_bbox)
                 
                 targets.append({'cls': t_cls, 'bboxes': t_bbox})
@@ -122,9 +124,9 @@ def validate(args):
                                 tps[pred_idx] = True
                                 detected.append(gt_idx)
                                 
-                stats.append((tps, pred[:, 4], pred[:, 5], t_cls))
+                stats.append((tps.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), t_cls.cpu()))
             else:
-                stats.append((torch.zeros(len(pred), dtype=torch.bool), pred[:, 4], pred[:, 5], torch.Tensor()))
+                stats.append((torch.zeros(len(pred), dtype=torch.bool), pred[:, 4].cpu(), pred[:, 5].cpu(), torch.Tensor()))
                 
     # Compute mAP
     stats = [np.concatenate(x, 0) for x in zip(*stats)]
