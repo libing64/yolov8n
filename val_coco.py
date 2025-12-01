@@ -55,6 +55,10 @@ def validate(args):
     iou_thres = 0.5
     conf_thres = 0.001
     
+    debug_count = 0
+    total_preds = 0
+    total_gts = 0
+    
     pbar = tqdm(val_loader, desc="Validating")
     for batch in pbar:
         imgs = batch['img'].to(device)
@@ -85,8 +89,19 @@ def validate(args):
             preds = model(imgs)
             preds = preds[0] if isinstance(preds, tuple) else preds
             preds = non_max_suppression(preds, conf_thres=conf_thres, iou_thres=0.6)
+        
+        # Debug first batch
+        if debug_count == 0:
+            print(f"\nDebug validation:")
+            print(f"  Model output shape: {preds[0].shape if len(preds[0]) > 0 else 'no detections'}")
+            print(f"  Num detections in batch: {[len(p) for p in preds]}")
+            if len(preds[0]) > 0:
+                print(f"  Sample detection: {preds[0][0]}")
+            debug_count += 1
             
         for i, pred in enumerate(preds):
+            total_preds += len(pred)
+            total_gts += len(targets[i]['cls'])
             t_cls = targets[i]['cls']
             t_bbox = targets[i]['bboxes']
             
@@ -156,8 +171,9 @@ def validate(args):
                 ap.append(compute_ap(recall, precision))
                 
         print(f"mAP@0.5: {np.mean(ap):.4f}")
+        print(f"Total predictions: {total_preds}, Total ground truths: {total_gts}")
     else:
-        print("No matches found.")
+        print(f"No matches found. Total predictions: {total_preds}, Total ground truths: {total_gts}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
