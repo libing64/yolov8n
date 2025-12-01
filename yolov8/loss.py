@@ -323,6 +323,9 @@ class v8DetectionLoss(nn.Module):
         gt_bboxes = xywh2xyxy(gt_bboxes)
         
         # Assign targets
+        # Decode predicted bounding boxes for assignment
+        pred_bboxes = dist2bbox(pred_distri.view(b, -1, 4, self.reg_max).softmax(-1).matmul(self.proj), anchor_points.unsqueeze(0), xywh=False) * stride_tensor.unsqueeze(0) # xyxy
+
         target_bboxes, target_scores, fg_mask = self.assigner(
             pred_scores.detach().sigmoid(),
             pred_bboxes.detach(),
