@@ -5,20 +5,29 @@ import torchvision
 
 def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
     """
-    Calculate Intersection over Union (IoU) of box1(1, 4) to box2(n, 4).
+    Calculate Intersection over Union (IoU) between box sets.
+    Supports both element-wise and pairwise (n x m) IoU computation.
 
     Args:
-        box1 (torch.Tensor): A tensor of shape (1, 4) representing a single bounding box.
-        box2 (torch.Tensor): A tensor of shape (n, 4) representing n bounding boxes.
-        xywh (bool): If True, input boxes are in (x, y, w, h) format. If False, input boxes are in (x1, y1, x2, y2) format.
-        GIoU (bool): If True, calculate Generalized IoU.
-        DIoU (bool): If True, calculate Distance IoU.
-        CIoU (bool): If True, calculate Complete IoU.
-        eps (float): A small value to avoid division by zero.
+        box1 (torch.Tensor): Boxes with shape (n, 4) or (..., n, 4)
+        box2 (torch.Tensor): Boxes with shape (m, 4) or (..., m, 4)
+        xywh (bool): If True, boxes are in (x, y, w, h) format. If False, (x1, y1, x2, y2).
+        GIoU, DIoU, CIoU (bool): Different IoU variants.
+        eps (float): Small value to avoid division by zero.
 
     Returns:
-        (torch.Tensor): IoU values.
+        (torch.Tensor): IoU values. For (n,4) and (m,4) inputs, returns (n, m).
     """
+    # For pairwise IoU: reshape (n, 4) -> (n, 1, 4) and (m, 4) -> (1, m, 4)
+    # Only do this for 2D tensors (validation use case) AND when shapes differ
+    # If shapes are identical, assume element-wise IoU is desired
+    needs_unsqueeze = (box1.dim() == 2 and box2.dim() == 2 and 
+                       box1.shape[0] != box2.shape[0])
+    if needs_unsqueeze:
+        box1 = box1.unsqueeze(1)  # (n, 1, 4)
+        box2 = box2.unsqueeze(0)  # (1, m, 4)
+    
+    # Get box coordinates
     if xywh:  # transform from xywh to xyxy
         (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
         w1_, h1_, w2_, h2_ = w1 / 2, h1 / 2, w2 / 2, h2 / 2
@@ -27,12 +36,12 @@ def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7
     else:  # x1, y1, x2, y2 = box1
         b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
         b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
-        w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
-        w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+        w1, h1 = b1_x2 - b1_x1, (b1_y2 - b1_y1).clamp(min=eps)
+        w2, h2 = b2_x2 - b2_x1, (b2_y2 - b2_y1).clamp(min=eps)
 
     # Intersection area
-    inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
-            (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
+    inter = (torch.minimum(b1_x2, b2_x2) - torch.maximum(b1_x1, b2_x1)).clamp(min=0) * \
+            (torch.minimum(b1_y2, b2_y2) - torch.maximum(b1_y1, b2_y1)).clamp(min=0)
 
     # Union Area
     union = w1 * h1 + w2 * h2 - inter + eps
@@ -40,8 +49,8 @@ def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7
     # IoU
     iou = inter / union
     if CIoU or DIoU or GIoU:
-        cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)  # convex (smallest enclosing box) width
-        ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)  # convex height
+        cw = torch.maximum(b1_x2, b2_x2) - torch.minimum(b1_x1, b2_x1)  # convex (smallest enclosing box) width
+        ch = torch.maximum(b1_y2, b2_y2) - torch.minimum(b1_y1, b2_y1)  # convex height
         if CIoU or DIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
             c2 = cw ** 2 + ch ** 2 + eps  # convex diagonal squared
             rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 + (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4  # center dist ** 2

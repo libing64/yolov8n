@@ -22,20 +22,30 @@ pip install -r requirements.txt
 
 ## 2. Usage
 
-### Training
+### Training on COCO Dataset
 
-Train the model on your dataset. The data directory should contain `images` and `labels` subdirectories.
-
-```bash
-python train.py --data /path/to/data --epochs 100 --batch-size 16 --img-size 640
+Train the model on the COCO2017 dataset. The script expects data at `/home/libing/dataset/coco2017` with the following structure:
+```
+/home/libing/dataset/coco2017/
+├── train2017/
+├── val2017/
+└── annotations/
+    ├── instances_train2017.json
+    └── instances_val2017.json
 ```
 
-### Evaluation
+```bash
+python train_coco.py --epochs 100 --batch-size 16 --img-size 640
+```
 
-Evaluate the trained model.
+The training script will automatically run validation at the end of each epoch and print mAP@0.5.
+
+### Evaluation on COCO Dataset
+
+Evaluate the trained model on the COCO validation set:
 
 ```bash
-python val.py --data /path/to/data --weights runs/train/exp/weights/epoch_100.pt
+python val_coco.py --weights runs/train/coco/weights/epoch_100.pt
 ```
 
 ## Features

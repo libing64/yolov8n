@@ -12,7 +12,8 @@ class BboxLoss(nn.Module):
     def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, stride_tensor):
         # IoU loss
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        # IoU loss (using regular IoU instead of CIoU for stability)
+        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=False)
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
         # DFL loss
@@ -299,17 +300,6 @@ class v8DetectionLoss(nn.Module):
             mask_gt
         )
         
-        # Debug output
-        if not hasattr(self, '_debug_printed'):
-            print(f"\nLoss Debug:")
-            print(f"  anchor_points range: {anchor_points.min():.2f} - {anchor_points.max():.2f}")
-            print(f"  stride_tensor range: {stride_tensor.min():.2f} - {stride_tensor.max():.2f}")
-            print(f"  anchor_points * stride: {(anchor_points * stride_tensor).min():.2f} - {(anchor_points * stride_tensor).max():.2f}")
-            print(f"  gt_bboxes range: {gt_bboxes.min():.2f} - {gt_bboxes.max():.2f}")
-            print(f"  pred_bboxes range: {pred_bboxes.min():.2f} - {pred_bboxes.max():.2f}")
-            print(f"  fg_mask sum: {fg_mask.sum().item()}")
-            print(f"  target_scores sum: {target_scores.sum().item()}")
-            self._debug_printed = True
         
         target_scores_sum = max(target_scores.sum(), 1)
         
@@ -321,21 +311,10 @@ class v8DetectionLoss(nn.Module):
         # Bbox loss
         if fg_mask.sum():
             loss[0], loss[2] = self.bbox_loss(pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, stride_tensor)
-        
-        # Debug loss values before scaling
-        if not hasattr(self, '_loss_debug'):
-            print(f"  Raw losses - box: {loss[0].item():.4f}, cls: {loss[1].item():.4f}, dfl: {loss[2].item():.4f}")
-            self._loss_debug = True
             
         loss[0] *= self.hyp['box']
         loss[1] *= self.hyp['cls']
         loss[2] *= self.hyp['dfl']
-        
-        # Debug loss values after scaling
-        if not hasattr(self, '_loss_debug2'):
-            print(f"  Scaled losses - box: {loss[0].item():.4f}, cls: {loss[1].item():.4f}, dfl: {loss[2].item():.4f}")
-            print(f"  Total loss: {loss.sum().item():.4f}")
-            self._loss_debug2 = True
         
         # Return total loss (don't multiply by batch_size - that's wrong!)
         return loss.sum(), torch.cat((loss[0].unsqueeze(0), loss[1].unsqueeze(0), loss[2].unsqueeze(0))).detach()
